@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+
+packdir() {
+  local prev_opts
+  prev_opts="$(shopt -po)"
+
+  local -i _interrupted=0
+  _packdir_on_int() {
+    _interrupted=1
+  }
+
+_packdir_cleanup() {
+  trap - INT RETURN
+  eval "$prev_opts"
+}
+
+trap '_packdir_cleanup' RETURN
+trap '_packdir_on_int' INT
+
+shopt -s globstar dotglob nullglob extglob
+
+local target_dir="${1:-.}"
+local out_file="${2:-combined_codebase.md}"
+local ext="${3#.}"
+
+if [[ ! -d "$target_dir" ]]; then
+  printf '%s\n' "Error: Direktori '$target_dir' tidak ditemukan." >&2
+  return 1
+fi
+
+local abs_target abs_out out_dir out_base
+abs_target="$(cd -- "$target_dir" && pwd -P)" || return 1
+(( _interrupted )) && { printf '\n%s\n' "Dihentikan (Ctrl+C)." >&2; return 130; }
+
+if [[ "$out_file" == */* ]]; then
+  out_dir="${out_file%/*}"
+  out_base="${out_file##*/}"
+else
+  out_dir="."
+  out_base="$out_file"
+fi
+abs_out="$(cd -- "$out_dir" 2>/dev/null && pwd -P || printf '%s' "$out_dir")/$out_base"
+
+local -a raw files=()
+if [[ -n "$ext" ]]; then
+  raw=("$abs_target"/**/*."$ext")
+else
+  raw=("$abs_target"/**/*)
+fi
+
+local f f_base
+for f in "${raw[@]}"; do
+  if (( _interrupted )); then
+    printf '\n%s\n' "Dihentikan (Ctrl+C)." >&2
+    return 130
+  fi
+
+  [[ -f "$f" && ! -L "$f" ]] || continue
+  [[ "$f" == "$abs_out" ]] && continue
+
+  case "$f" in
+    */.git/*|*/.godot/*|*/target/*|*/node_modules/*|*/dist/*|*/build/*|*/.venv/*|*/__pycache__/*)
+      continue ;;
+  esac
+
+  f_base="${f##*/}"
+  case "$f_base" in
+    Cargo.lock|package-lock.json|yarn.lock|pnpm-lock.yaml|bun.lock|bun.lockb|*.import|*.uid)
+      continue ;;
+  esac
+
+  files+=("$f")
+done
+
+if (( ${#files[@]} == 0 )); then
+  printf '%s\n' "Tidak ada file yang cocok ditemukan di '$target_dir'." >&2
+  return 1
+fi
+
+# Helper progress bar murni Bash builtin ke /dev/tty (fallback ke stderr)
+local prog_fd="/dev/tty"
+[[ -w "$prog_fd" ]] || prog_fd="/dev/stderr"
+
+_packdir_progress() {
+  local -i cur="$1" total="$2" width=28
+  (( total <= 0 )) && return 0
+
+  local -i pct=$(( cur * 100 / total ))
+  local -i filled=$(( cur * width / total ))
+  local -i empty=$(( width - filled ))
+  local bar_done="" bar_todo=""
+  local -i k
+
+  for (( k = 0; k < filled; k++ )); do bar_done+="#"; done
+  for (( k = 0; k < empty; k++ )); do bar_todo+="-"; done
+
+  printf '\r[%s%s] %3d%% (%d/%d)' "$bar_done" "$bar_todo" "$pct" "$cur" "$total" > "$prog_fd"
+}
+
+local root_name="${abs_target##*/}"
+local rel_path f_ext lang fence line
+local -i i depth has_3 has_4 total_files=${#files[@]} done_count=0
+
+  {
+    printf '%s\n' "# Codebase: \`$root_name\`"
+    printf '\nTotal files: %d\n\n## Directory Structure\n\n```text\n%s/\n' "$total_files" "$root_name"
+
+    for f in "${files[@]}"; do
+      (( _interrupted )) && break
+      rel_path="${f#"$abs_target"/}"
+      local -a parts=()
+      IFS='/' read -r -a parts <<< "$rel_path"
+      for (( i = 0; i < ${#parts[@]} - 1; i++ )); do
+        depth=$(( i * 2 ))
+        printf '%*s|-- %s/\n' "$depth" "" "${parts[i]}"
+      done
+      depth=$(( (${#parts[@]} - 1) * 2 ))
+        printf '%*s`-- %s\n' "$depth" "" "${parts[-1]}"
+      done
+
+      printf '```\n\n---\n\n## Source Files\n\n'
+
+      _packdir_progress 0 "$total_files"
+
+      for f in "${files[@]}"; do
+        if (( _interrupted )); then
+          break
+        fi
+
+        (( done_count++ ))
+        _packdir_progress "$done_count" "$total_files"
+
+        [[ -r "$f" ]] || continue
+
+        f_base="${f##*/}"
+        f_ext=""
+        [[ "$f_base" == *.* ]] && f_ext="${f_base##*.}"
+        f_ext="${f_ext,,}"
+
+        case "$f_ext" in
+          rs) lang="rust" ;;
+          toml) lang="toml" ;;
+          js|mjs|cjs) lang="javascript" ;;
+          ts|tsx) lang="typescript" ;;
+          py) lang="python" ;;
+          sh|zsh|bash) lang="bash" ;;
+          json) lang="json" ;;
+          yaml|yml) lang="yaml" ;;
+          html) lang="html" ;;
+          css) lang="css" ;;
+          md) lang="markdown" ;;
+          gd) lang="gdscript" ;;
+          glsl) lang="glsl" ;;
+          lua) lang="lua" ;;
+          c|h|ino) lang="c" ;;
+          cpp|cc|cxx|hpp) lang="cpp" ;;
+          *) lang="$f_ext" ;;
+        esac
+
+        has_3=0
+        has_4=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          (( _interrupted )) && break
+          [[ "$line" == *'```'* ]] && has_3=1
+          [[ "$line" == *'````'* ]] && has_4=1
+        done < "$f"
+
+        (( _interrupted )) && break
+
+        if (( has_4 )); then
+          fence='`````'
+        elif (( has_3 )) || [[ "$lang" == "markdown" ]]; then
+          fence='````'
+        else
+          fence='```'
+        fi
+
+        printf '### `%s`\n\n%s%s\n' "${f#"$abs_target"/}" "$fence" "$lang"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          (( _interrupted )) && break
+          printf '%s\n' "$line"
+        done < "$f"
+        printf '%s\n\n' "$fence"
+      done
+    } > "$out_file"
+
+  if (( _interrupted )); then
+    printf '\n%s\n' "Dihentikan (Ctrl+C). Output mungkin belum lengkap di '$out_file'." >&2
+    return 130
+  fi
+
+  printf '\n%s\n' "Berhasil menggabungkan $total_files file ke '$out_file'."
+}
+
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] && packdir "$@"
